@@ -1,5 +1,5 @@
 # nfk_timing
-The dataset for the paper "The influence of time-of-day on estimates of taxonomic versus functional diversity in avian communities" published in Bird Study.
+The dataset for the paper "The influence of time-of-day on estimates of taxonomic versus functional diversity in avian communities" [published](https://doi.org/10.1080/00063657.2023.2298661) in Bird Study.
 
 The dataset contains the following columns:
 
