@@ -1,0 +1,1240 @@
+---
+title: "The influence of time-of-day on estimates of taxonomic versus functional diversity
+  in avian communities"
+author: "Xxxxxxx Xxxxxxx, Xxxx X. Xxxxxxx"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=T, warning=FALSE, error=FALSE, message=FALSE, results='hide'}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+
+h <- taskCallbackManager()
+h$add(function(expr, value, ok, visible) { 
+  options("prompt"=format(Sys.time(), "%H:%M:%S> ")); 
+  return(TRUE) }, 
+  name = "simpleHandler")
+
+library(tidyverse)
+library(ancends)
+library(corrplot)
+library(Momocs)
+library(lubridate)
+library(qpcR)
+library(mgcv)
+library(ggpubr)
+
+select <- dplyr::select #masked by MASS
+
+'%!in%' <- function(x,y)!('%in%'(x,y))
+
+excna <- function(x){
+  naid <- which(is.na(x))
+  x[-naid]
+}
+
+exczero <- function(x){
+  naid <- which(x == 0)
+  x[-naid]
+}
+```
+
+```{r hidden-lines, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE, error=FALSE}
+#author names: Oleksii Dubovyk, Eric L. Walters
+# library(devtools)
+# devtools::install_github("OleksiiDubovyk/ancends")
+nfk <- read_csv("https://raw.githubusercontent.com/OleksiiDubovyk/nfk_timing/main/nfk_counts.csv")
+traits <- read_csv("https://raw.githubusercontent.com/OleksiiDubovyk/fundiv/main/traits6_v0.csv")
+#traits dataset https://doi.org/10.5281/zenodo.7884472
+```
+
+
+# Data
+
+The data for this work are available online.
+
+Point count results can be uploaded as
+
+```{r nfk-count, warning=FALSE, error=FALSE, message=FALSE, eval=FALSE}
+nfk <- read_csv("https://raw.githubusercontent.com/*******x*******/**********/main/nfk_counts.csv")
+```
+
+Functional traits data are available at https://doi.org/10.xxxx/zenodo.xxxxxxx (v0) or
+
+```{r traits, warning=FALSE, error=FALSE, message=FALSE, eval=FALSE}
+traits <- read_csv("https://raw.githubusercontent.com/*******x*******/******/main/traits6_v0.csv")
+```
+
+# Distribution of sampled time of day
+
+Overall distribution is sampled sufficiently evenly.
+
+```{r timing-distr-all, warning=FALSE, error=FALSE, message=FALSE}
+hist(nfk$T, freq = F, main = "Daylight time", xlab = "Daylight time")
+abline(v = c(0, 0.25, 0.5, 0.75, 1), lty = 2)
+lines(density(nfk$T), col = "red", lwd = 2)
+lines(density(rep(seq(0.05, 0.95, 0.1), 42)), col = "blue", lwd = 2, lty = 2)
+```
+
+Kolomogorov-Smirnov test to check whether the distribution differs from uniform:
+
+```{r timing-ks, warning=FALSE, error=FALSE, message=FALSE}
+ks.test(nfk$T, "punif")
+```
+
+Separate test for each individual location:
+
+```{r timing-distr, warning=FALSE, error=FALSE, message=FALSE}
+for (point in unique(nfk$Point)){
+  subset_nfk <- nfk %>%
+    filter(Point == point)
+  hist(subset_nfk$T, freq = F, 
+       main = paste("Point", point, ", K.-s. test p =", 
+                    round(ks.test(subset_nfk$T, "punif")$p.value, digits = 3)), 
+       xlab = "Daylight time")
+  abline(v = c(0, 0.25, 0.5, 0.75, 1), lty = 2)
+  lines(density(subset_nfk$T), col = "red", lwd = 2)
+  lines(density(rep(seq(0.05, 0.95, 0.1), 42)), col = "blue", lwd = 2, lty = 2)
+}
+```
+
+# Estimation of taxonomic diversity
+
+```{r tax-div}
+nfk_N <- apply(nfk[,-c(1:8)], 1, function(x) sum(x, na.rm = T))
+#transform abundances into species proportions
+nfk_p <- as.data.frame(t(apply(nfk[,-c(1:8)], 1, function(x) x/sum(x, na.rm = T))))
+#species richness
+nfk_S <- apply(nfk_p, 1, function(x) length(excna(x)))
+#shannon raw
+nfk_shannon <- apply(nfk[,-c(1:8)], 1, function(x) shannon(excna(x)))
+#shannon normalized
+nfk_shannonS <- nfk_shannon/log(nfk_S)
+nfk_shannonS <- ifelse(is.na(nfk_shannonS), 0, nfk_shannonS)
+#hurlbert's pie
+nfk_pie <- apply(nfk[,-c(1:8)], 1, function(x) hpie(excna(x)))
+```
+
+# Estimation of functional diversity
+
+## Preparation for estimation of functional diversity
+
+```{r fd-helpers, warning=FALSE, error=FALSE, message=FALSE}
+#rewrite character variables as factors
+traits <- traits %>%
+  mutate(dev = as_factor(dev),
+         naggr = as_factor(naggr),
+         brsys = as_factor(brsys),
+         nest = as_factor(nest),
+         fc_categ = as_factor(fc_categ))
+
+#Functional  TraitS indices, n=71
+fts <- c(11,16,18,20,28,32,22,23,21,30,31,33,34,38,39,62,63,64,65,40:51,52:61,66:76,77:95)
+
+trait_numind <- c("hwi", "mlife", "adsurviv", "matage", "suces", "bmass", "egglow",
+                  "eggupp", "parasi", "attem",     
+                  "ndepen", "fpnoct", "fpdiur", "klepto") #names of numeric variables
+
+nest <- matrix(c(0.0, 0.1, 0.2, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.75, 0.8, 0.85, 0.9, 0.95,
+                 0.1, 0, 0.25, 0.35, 0.4, 0.45, 0.55, 0.6, 0.65, 0.75, 0.8, 0.85, 0.9, 0.95,
+                 0.2, 0.25, 0, 0.5, 0.55, 0.55, 0.3, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9,
+                 0.4, 0.35, 0.5, 0, 0.15, 0.25, 0.6, 0.6, 0.6, 0.8, 0.8, 0.9, 0.9, 0.9,
+                 0.45, 0.4, 0.55, 0.15, 0, 0.3, 0.6, 0.6, 0.6, 0.8, 0.8, 0.8, 0.9, 0.9,
+                 0.5, 0.45, 0.55, 0.25, 0.3, 0, 0.6, 0.5, 0.4, 0.4, 0.35, 0.35, 0.7, 0.7,
+                 0.55, 0.55, 0.3, 0.6, 0.6, 0.6, 0, 0.2, 0.3, 0.6, 0.6, 0.7, 0.8, 0.9,
+                 0.6, 0.6, 0.5, 0.6, 0.6, 0.5, 0.2, 0, 0.15, 0.5, 0.7, 0.8, 0.8, 0.9,
+                 0.65, 0.65, 0.6, 0.6, 0.6, 0.4, 0.3, 0.15, 0, 0.4, 0.5, 0.6, 0.7, 0.8,
+                 0.75, 0.75, 0.7, 0.8, 0.8, 0.4, 0.6, 0.5, 0.4, 0, 0.5, 0.5, 0.6, 0.6,
+                 0.8, 0.8, 0.75, 0.8, 0.8, 0.35, 0.6, 0.7, 0.5, 0.5, 0, 0.2, 0.15, 0.6,
+                 0.85, 0.85, 0.8, 0.9, 0.8, 0.35, 0.7, 0.8, 0.6, 0.5, 0.2, 0, 0.1, 0.6,
+                 0.9, 0.9, 0.85, 0.9, 0.9, 0.7, 0.8, 0.8, 0.7, 0.6, 0.15, 0.1, 0, 0.6,
+                 0.95, 0.95, 0.9, 0.9, 0.9, 0.7, 0.9, 0.9, 0.8, 0.6, 0.6, 0.6, 0.6, 0),
+               ncol = 14, nrow = 14, byrow = T)
+colnames(nest) <- c("no", "paras", "scrape", "crevice", "burrow", "cavity", "platform", 
+                    "saucer", "cup",
+                    "sphere", "chamber", "oven", "gourd", "pend")
+rownames(nest) <- c("no", "paras", "scrape", "crevice", "burrow", "cavity", "platform", 
+                    "saucer", "cup",
+                    "sphere", "chamber", "oven", "gourd", "pend")
+#matrix of categories distance for nest type
+
+dev <- matrix(c(0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0,
+                0.1, 0.0, 0.1, 0.3, 0.5, 0.7, 0.9,
+                0.2, 0.1, 0.0, 0.2, 0.4, 0.6, 0.8,
+                0.4, 0.3, 0.2, 0.0, 0.2, 0.4, 0.6,
+                0.6, 0.5, 0.4, 0.2, 0.0, 0.2, 0.4,
+                0.8, 0.7, 0.6, 0.4, 0.2, 0.0, 0.2,
+                1.0, 0.9, 0.8, 0.6, 0.4, 0.2, 0.0),
+              ncol = 7, nrow = 7, byrow = T)
+colnames(dev) <- c("pre2", "pre3", "pre4", "semipre", "semialt1", "semialt2", "alt")
+rownames(dev) <- c("pre2", "pre3", "pre4", "semipre", "semialt1", "semialt2", "alt")
+#same for hatching development
+
+brsys <- matrix(c(0, 0.25, 0.4, 0.6, 0.8, 0.8, 0.7,
+                  0.25, 0, 0.3, 0.3, 0.5, 0.5, 0.9,
+                  0.4, 0.3, 0, 0.25, 0.4, 0.4, 1,
+                  0.6, 0.3, 0.25, 0, 0.5, 0.5, 0.9,
+                  0.8, 0.5, 0.4, 0.5, 0, 0.25, 0.6,
+                  0.8, 0.5, 0.4, 0.5, 0.25, 0, 0.6,
+                  0.7, 0.9, 1, 0.6, 0.6, 0.6, 0),
+                nrow = 7, ncol = 7, byrow = T)
+colnames(brsys) <- c("coop", "polygam", "promisc", "lek", "polyand", "polygyn", "monog")
+rownames(brsys) <- c("coop", "polygam", "promisc", "lek", "polyand", "polygyn", "monog") 
+#same for breeding system
+
+fc_categ <- matrix(c(0, 0.6, 0.4, 0.2, 0.8,
+                     0.6, 0, 0.5, 0.7, 0.2,
+                     0.4, 0.5, 0, 0.5, 0.4,
+                     0.2, 0.7, 0.5, 0, 0.3,
+                     0.8, 0.2, 0.4, 0.3, 0),
+                   nrow = 5, ncol = 5, byrow = T)
+colnames(fc_categ) <- c("FruiNect", "Invertebrate", "Omnivore", "PlantSeed", "VertFishScav")
+rownames(fc_categ) <- c("FruiNect", "Invertebrate", "Omnivore", "PlantSeed", "VertFishScav") 
+#same for diet categories
+
+naggr <- matrix(c(0, 0.5, 1,
+                  0.5, 0, 0.5,
+                  1, 0.5, 0),
+                nrow = 3, ncol = 3, byrow = T)
+colnames(naggr) <- c(1, 2, 3)
+rownames(naggr) <- c(1, 2, 3) #same for nest aggregation level
+
+trait_catmxs <- list(nest = nest, dev = dev, brsys = brsys, fc_categ = fc_categ, naggr = naggr)
+trait_catind <- names(trait_catmxs)
+
+trait_grind <- list(ns = c("nsbank", "nsgroun", "nsgrass", "nsclif", "nsbuild", "nsshru", 
+                           "nsdeci", "nsconi", 
+                           "nssnag", "nscact", "nstang", "nsfloat"),
+                    fs = c("fsmud", "fswatb", "fswata", "fstimb", "fsgroun", "fsunder", 
+                           "fsmidhigh", "fscanopy",
+                           "fsaerial", "fsdump"),
+                    fc = c("fcinvert", "fcvend", "fcvect", "fcfish", "fcunk", "fcscav", 
+                           "fcfruit", "fcnect", "fcseed",
+                           "fcgree", "fcleft"),
+                    fm = c("fmdig", "fmgrgl", "fmfogl", "fmbagl", "fmhogl", "fmhopo", 
+                           "fmhawk", "fmaero", "fmapur",
+                           "fmswoo", "fmhipa", "fmlopa", "fmhidi", "fmskim", "fmsdiv", 
+                           "fmsdip", "fmdabb", "fmstal",
+                           "fmprob")) #grouped variables
+```
+
+## Estimating species distinctiveness in the regional pool
+
+```{r fd-centroid}
+#estimation of "regional" (e.g., within the study area) abundances of each species
+#as sum of mean abundances (mean as an expectation of Poisson distribution, assuming that 
+# species abundances is a Poisson process)
+# of species at each point
+regional_species_abun <- nfk[,-c(1:5, 7:8)] %>% 
+  group_by(Point) %>%
+  summarise_all(mean, na.rm = T) %>%
+  select(-`Point`) %>%
+  apply(MARGIN = 2, FUN = function(x) sum(excna(x)))
+
+#calculation of a centroid
+centroid <- function(x, weighted = F, weights){
+  if (!weighted){
+      l <- vector(mode = "list", length = ncol(x))
+      for (j in 1:ncol(x)){
+        if (is.numeric(x[j][[1]])){
+          l[[j]] <- mean(x[j][[1]])
+        }else if (is.factor(x[j][[1]])){
+          l[[j]] <- summary(x[j][[1]])/nrow(x)
+        }
+      }
+  } else {
+    if (missing(weights)){
+      warning("weights are not provided, assuming equal weights")
+      weights <- rep(1, nrow(x))
+    }
+      if (length(weights) != nrow(x)){
+        stop("length of weights differs from number of rows in x")
+      }
+    w <- weights/sum(weights)
+      l <- vector(mode = "list", length = ncol(x))
+        for (j in 1:ncol(x)){
+          if (is.numeric(x[j][[1]])){
+            l[[j]] <- sum(w*x[j][[1]])
+          }else if (is.factor(x[j][[1]])){
+            lvls <- levels(x[j][[1]])
+            l[[j]] <- sapply(lvls, function(lvl){
+              sum(w[which(x[j][[1]] == lvl)])
+            })
+          }
+        }
+  }
+  names(l) <- colnames(x)
+  return(l)
+}
+
+#subsetting traits of all North American species to those observed
+nfk_traits <- traits %>%
+  filter(proj_id %in% names(regional_species_abun))
+
+#arranging regional_species_abun in the same order
+regional_species_abun <- regional_species_abun[as.character(nfk_traits$proj_id)]
+
+nfk_centroid_weighted <- centroid(nfk_traits[, fts],#again, fts is index of columns in 
+                                  # traits that correspond to the actual traits,
+                                  weighted = T, weights = regional_species_abun)
+
+nfk_centroid_unweighted <- centroid(nfk_traits[, fts])
+```
+
+Both weighted and unweighted centroids are stored as lists to account for their complex nature.
+
+Now, to use any dimension technique, one needs to estimate species distinctiveness from the centroid.
+
+```{r fd-spp-dist}
+
+distinct <- function(x, cen, numind, catind, catmxs, grind){
+  #x : dataframe with cols-traits and rows-species
+  #cen : list with names-traits and values {mean for numeric, vector of freqs 
+  # for categorical}
+  #numind : vector of numeric variables indices or names
+  #catind : vector of categorical variables indices or names
+  #catmxs : named (=traits) list of distance matrices for categorical variables
+  #grind : named (=name of group) list of names of trait variables {e.g., ns: nsbank, 
+  # nsground,...}
+  #
+  #helpers
+  cat_dist <- function(value, mx, freqs){
+    #calculate distance between categorical trait values based on a similarity matrix
+    distances <- mx[, which(colnames(mx) == value)] # distances between the value and all 
+    #other possible values
+    ws <- matrix(NA, ncol = 2, nrow = length(freqs))
+    colnames(ws) <- c("distance", "weight")
+    #rownames(ws) <- colnames(mx)
+    rownames(ws) <- names(freqs)
+    for (cat in rownames(ws)){
+      ws[cat,] <- c(distances[cat], ifelse(cat == value, 0, freqs[cat]))
+    } # two arranged vectors of distances and weights of the categories (self-similarity 
+    # means 0 distinctiveness)
+    sum(ws[,1]*ws[,2]) / max(ws[,1]) # normalized by the maximum possible distinctiveness
+  }
+  group_overlap <- function(vec, cen){
+    #calculate overlap between two discrete distributions
+    vec <- vec/sum(vec)
+    cen <- unlist(cen)/sum(unlist(cen))
+    overlap <- sapply(1:length(vec), function(i) min(vec[i], cen[i]))
+    sum(overlap)
+  }
+  #
+  #numeric variables
+  numvals <- matrix(NA, nrow = nrow(x), ncol = length(numind))
+  colnames(numvals) <- numind
+  rownames(numvals) <- rownames(x)
+  for (trait in numind){
+    numvals[,trait] <- sapply(x[,trait], function(taxa_value){
+      abs(taxa_value - unlist(cen[trait]))
+    })
+  }
+  rownames(numvals) <- rownames(x)
+  
+  #categorical variables
+  catvals <- matrix(NA, nrow = nrow(x), ncol = length(catind))
+  colnames(catvals) <- catind
+  rownames(catvals) <- rownames(x)
+  for (trait in catind){
+    mx <- catmxs[trait][[1]]
+    sp <- 1
+    for (taxa_value in x[,trait]){
+      catvals[sp, trait] <- cat_dist(value = taxa_value, 
+                                     mx = mx, 
+                                     freqs = cen[trait][[1]])
+      sp <- sp+1
+    }
+  }
+  #grouped variables
+  grvals <- matrix(NA, nrow = nrow(x), ncol = length(grind))
+  rownames(grvals) <- rownames(x)
+  colnames(grvals) <- names(grind)
+  for (trait in names(grind)){
+    traits <- grind[trait][[1]]
+    for (taxa in rownames(x)){
+      grvals[taxa, trait] <- group_overlap(vec = unlist(x[taxa, traits]), 
+                                           cen = unlist(cen[traits]))
+    }
+  }
+  
+  grdist <- matrix(NA, nrow = nrow(x), ncol = length(grind))
+  rownames(grdist) <- rownames(x)
+  colnames(grdist) <- names(grind)
+  mo <- NA
+  for (trait in names(grind)){
+    mo <- max(grvals[,trait])
+    grdist[,trait] <- 1-(grvals[,trait]/mo)
+  }
+  cbind(numvals, catvals, grdist)
+}
+
+#scale since units differ among traits
+td_weighted <- distinct(x = as.data.frame(nfk_traits), 
+                        cen = nfk_centroid_weighted, 
+                        numind = trait_numind,
+                        catind = trait_catind,
+                        grind = trait_grind,
+                        catmxs = trait_catmxs) %>%
+  scale()
+td_unweighted <- distinct(x = as.data.frame(nfk_traits), 
+                        cen = nfk_centroid_unweighted, 
+                        numind = trait_numind,
+                        catind = trait_catind,
+                        grind = trait_grind,
+                        catmxs = trait_catmxs) %>%
+  scale()
+
+```
+
+Now, one can apply PCA to distinctiveness to reduce number of dimensions. Although it is applied to trait distinctiveness rather to the raw trait values, it is still a valid approach because (1) individual trait distinctiveness is a metric of deviation of a species along a singular trait axis, and (2) it allows PCA deal with non-metric raw traits.
+
+```{r fd-pca}
+td_pca_weighted <- prcomp(td_weighted[,!is.na(apply(td_weighted, 2, var))])
+td_pca_unweighted <- prcomp(td_unweighted[,!is.na(apply(td_unweighted, 2, var))])
+
+corrplot(cor(td_weighted[,!is.na(apply(td_weighted, 2, var))], 
+             td_pca_weighted$x, method = "kendall"), title = "Weighted", method = "ellipse")
+
+corrplot(cor(td_unweighted[,!is.na(apply(td_unweighted, 2, var))], 
+             td_pca_weighted$x, method = "kendall"), title = "Unweighted", method = "ellipse")
+```
+
+Both weighted and unweighted by abundance approaches produce similar results. One could infer several principal components corresponding to species' ecological features:
+
+  - `PC1` is mostly correlated with `mlife` (maximum life longevity), `matage` (minimum mating age), `dev` (development stage at hatching), and `nest` (nest type), representing **reproductive biology**;
+  
+  - `PC2` is correlated with `egglow`/`eggupp` (clutch size), `parasi` (nest parasitism), `matage` (minimum mating age), and `ndepen` (degree of dependency on other species' activity to build a nest), representing **nesting traits**;
+  
+  - `PC3` is correlated with `suces` (nesting success), `naggr` (nest aggregation), and `brsys` (breeding system), that might correspond to **species' degree of sociality**;
+  
+  - `PC4` is correlated with `hwi` (hand-wing index), `ns` (nest substrate), and `klepto` (kleptoparasitism), all of which point at species' movement ecology and habitat fidelity, therefore, relate to **dispersal ecology**;
+  
+  - `PC5` is correlated with `fs` (feeding substrate) and `fm` (feeding methods), representing **foraging ecology**;
+  
+  - `PC6` is correlated with `ndepen` (nesting dependency on other species), `naggr` (nesting aggregation), and `ns` (nest substrate), which may represent **interspecific nesting requirements**.
+  
+All together, these PCs accumulate approximately half of trait variance:
+
+```{r pca-var}
+(td_pca_weighted$sdev*100/sum(td_pca_weighted$sdev)) %>% plot(type = "l", xlab = "PC", 
+                                                              ylab = "% total variance")
+(td_pca_unweighted$sdev*100/sum(td_pca_unweighted$sdev)) %>% lines(col = "red")
+legend("topright", legend=c("Weighted", "Unweighted"), col=c("black", "red"), 
+       lty = c(1, 1))
+
+paste("PCs 1, 2, 3, 4, 5, 6 account for", 
+      ((td_pca_weighted$sdev*100/sum(td_pca_weighted$sdev))[1:6] %>% sum() %>% 
+         round(digits = 2)), "% of variance in weighted trait distinctiveness")
+paste("PCs 1, 2, 3, 4, 5, 6 account for", 
+      ((td_pca_unweighted$sdev*100/sum(td_pca_unweighted$sdev))[1:6] %>% sum() %>% 
+         round(digits = 2)), "% of variance in unweighted trait distinctiveness")
+```
+
+Now we write these PCs of each species:
+
+```{r dfist-pcs}
+fdpca_weighted <- td_pca_weighted$x[,1:6]
+fdpca_weighted <- fdpca_weighted %>%
+  as_tibble() %>%
+  mutate(proj_id = nfk_traits$proj_id %>% unlist(),
+         reproduction = PC1,
+         nesting = PC2,
+         sociality = PC3,
+         dispersal = PC4,
+         feeding = PC5,
+         interspecific = PC6) %>%
+  select(proj_id, reproduction, nesting, sociality, dispersal, feeding, interspecific)
+fdpca_unweighted <- td_pca_unweighted$x[,1:6]
+fdpca_unweighted <- fdpca_unweighted %>%
+  as_tibble() %>%
+  mutate(proj_id = nfk_traits$proj_id %>% unlist(),
+         reproduction = PC1,
+         nesting = PC2,
+         sociality = PC3,
+         dispersal = PC4,
+         feeding = PC5,
+         interspecific = PC6) %>%
+  select(proj_id, reproduction, nesting, sociality, dispersal, feeding, interspecific)
+```
+
+## Functional diversity metrics
+
+### Functional richness
+
+Functional richness is defined as convex hull volume of a community in multidimensional space of functional traits.
+
+```{r frich}
+frich <- function(taxa, traits){
+  traits %>%
+    filter(proj_id %in% taxa) %>%
+    select(-proj_id) %>%
+    as.data.frame() %>%
+    prcomp() %>%
+    as_PCA() %>%
+    get_chull_volume()
+}
+nfk_frich <- sapply(1:nrow(nfk),
+                    function(i){
+                      taxa_list <- nfk[i, -c(1:8)][!is.na(nfk[i, -c(1:8)] %>% unlist())] %>% 
+                        colnames()
+                      if(length(taxa_list) < 4){ #>=4 points needed to build a convex hull
+                        return(0)
+                      }else{
+                        return(frich(taxa_list, fdpca_weighted))
+                      }
+                    })
+```
+
+### Functional evenness
+
+Functional evenness is defined ([Villéger et al. 2008](https://doi.org/10.1890/07-1206.1)) as $$\text{FEve} = \frac{\sum\limits_{l=1}^{S-1}\min \left( \left[ \frac{\frac{d(i, j)}{w_i + w_j}}{\sum_{l = 1}^{S-1} \frac{d(i, j)}{w_i + w_j}} \right], \left[ \frac{1}{S-1} \right] \right) - \frac{1}{S-1}}{1 - \frac{1}{S-1}}$$
+
+where $l$ is a branch of a length $d(i, j)$ between species $i$ and $j$ in a trait space.
+
+```{r feve}
+feve <- function(traits, w){
+  if (nrow(traits) != length(w)){
+    stop("number of objects diesn't equal number of weights")
+  }
+  if (nrow(traits) <= 1){
+    return(0)
+  }else{
+    w <- w/sum(w)
+    traits <- as.data.frame(traits)
+    distmx <- dist(traits) %>% as.matrix()
+    diag(distmx) <- Inf
+    #distmx[upper.tri(distmx)] <- 9999
+    distmx <- distmx[-1,]
+    if (is.null(dim(distmx))){
+      branch_distances <- min(distmx)
+      branch_weights <- sum(w)
+    }else{
+      branch_distances <- apply(distmx, 1, min) %>% unlist()
+      branch_coordinates <- apply(distmx, 1, function(x) which(x == min(x))[1])
+      branch_weights <- sapply(1:length(branch_coordinates),
+                             function(i){
+                               w[names(branch_coordinates)[i]] + w[branch_coordinates[i]]
+                             })
+    }
+    ew <- branch_distances/branch_weights
+    pew <- ew/sum(ew)
+    S <- ifelse(nrow(traits) > 2, nrow(traits), nrow(traits)+1)
+    feve <- (sum(sapply(pew, function(pew_l){
+      min(pew_l, 1/(S-1))
+    } )) - (1/(S-1))) / (1 - (1 / (S-1)))
+    return(feve)
+  }
+}
+
+nfk_feve <- sapply(1:nrow(nfk),
+                    function(i){
+                      taxa_abun <- nfk[i, -c(1:8)][!is.na(nfk[i, -c(1:8)] %>% unlist())]
+                      taxa_list <- taxa_abun %>% colnames()
+                      taxa_traits <- fdpca_unweighted %>% scale() %>% as.data.frame()
+                      rownames(taxa_traits) <- fdpca_unweighted$proj_id
+                      taxa_traits <- taxa_traits[taxa_list, -1]
+                      return(feve(traits = taxa_traits, w = unlist(taxa_abun)))
+                    })
+```
+
+### Rao's quadratic entropy
+
+Rao's quadratic entropy ([Pavoine et al. 2005](https://doi.org/10.1016/j.tpb.2005.01.004)) can be calculated as $$\text{H}_D(p) = \sum\limits_{i=1}^S \sum\limits_{j = 1}^S p_i p_j d(i, j)$$
+
+where $d(i, j)$ is the distance between species $i$ and $j$ in functional space.
+
+```{r rao}
+rao <- function(traits, abun){
+  if (nrow(traits) != length(abun)){
+    stop("number of objects doesn't equal number of weights")
+  }
+  if (nrow(traits) <= 1){
+    return(0)
+  }else{
+    w <- abun/sum(abun)
+    traits <- as.data.frame(traits) %>% scale() %>% as.data.frame()
+    distmx <- dist(traits) %>% as.matrix()
+    entropy <- numeric(0)
+    for (i in 1:(nrow(traits)-1)){
+      for (j in (i+1):nrow(traits)){
+        entropy <- c(entropy,
+                     w[i]*w[j]*distmx[i, j])
+      }
+    }
+  return(sum(entropy))
+  }
+}
+
+nfk_rao <- sapply(1:nrow(nfk),
+                    function(i){
+                      taxa_abun <- nfk[i, -c(1:8)][!is.na(nfk[i, -c(1:8)] %>% unlist())]
+                      taxa_list <- taxa_abun %>% colnames()
+                      taxa_traits <- fdpca_unweighted %>% as.data.frame()
+                      rownames(taxa_traits) <- fdpca_unweighted$proj_id
+                      taxa_traits <- taxa_traits[taxa_list, -1]
+                      return(rao(traits = taxa_traits, abun = unlist(taxa_abun)))
+                    })
+```
+
+### Weighted mean distinctiveness
+
+Previous metrics assign zero values to observations of single species, even if such taxa are functionally distinctive in the regional pool. To account for that, weighted by abundance functional distinctiveness could also be used.
+
+```{r pfd}
+nfk_fdist <- apply(scale(fdpca_unweighted[,-1]), 1, function(x) sqrt(mean(pnorm(x)^2)))
+names(nfk_fdist) <- fdpca_unweighted[,1] %>% unlist()
+
+pfd <- function(fdist, w){
+  fd <- unlist(fdist)
+  fdnames <- names(fd)
+  w <- unlist(w)[fdnames]
+  w <- w/sum(w)
+  return(sum(fd*w))
+}
+
+nfk_pfd <- sapply(1:nrow(nfk),
+                    function(i){
+                      taxa_abun <- nfk[i, -c(1:8)][!is.na(nfk[i, -c(1:8)] %>% unlist())]
+                      taxa_list <- taxa_abun %>% colnames()
+                      taxa_fdist <- nfk_fdist[taxa_list]
+                      return(pfd(fdist = taxa_fdist, w = taxa_abun))
+                    })
+```
+
+# Analysis
+
+## Compiling prepared dataframe
+
+```{r compile-data}
+nfk_div <- nfk %>%
+  select(Date, #date, m/d/yyyy
+         Time, #local time
+         `T`, #time-of-day between sunrise (0) and sunset (1)
+         Per, #period of day: morning (m), noon (n), afternoon (a), or evening (e)
+         Dec, #decade from start of the study
+         Point, #obsevation location
+         W, #wind from still (0) to storm (10)
+         Cloud #cloud cover, %(100^-1)
+         ) %>%
+  mutate(Day = (mdy(Date) - ymd("2021-03-07")) %>% as.numeric()) %>% #day since beginning 
+  # of the study, reqs lubridate::*
+  mutate(Daytime = `T`) %>% select(-`T`) %>%
+  mutate(sprich = nfk_S, #species richness
+         shannon = nfk_shannon, #raw Shannon index
+         std_shannon = nfk_shannonS, #standardized Shannon index
+         pie = nfk_pie, #Hurlbert's probability of interspecific encounter
+         frich = nfk_frich, #functional richness
+         pfd = nfk_pfd, #weighted mean functional distinctiveness
+         feve = nfk_feve, #functional evenness
+         rao = nfk_rao #Rao's quadratic entropy
+         ) %>%
+  filter(sprich >= 4) #threshold of 4 species is minimum to calculate functional richness
+paste("4 or more species were observed in", nrow(nfk_div), "out of", nrow(nfk), "counts")
+```
+
+## Distribution of diversity metrics
+
+```{r shapiro}
+metrics_shapiro <- tibble(Metric = c("Species richness",
+                                     "Shannon index",
+                                     "Standardized Shannon",
+                                     "Hurlbert's PIE",
+                                     "Functional richness",
+                                     "Mean distinctiveness",
+                                     "Functional evenness",
+                                     "Rao's entropy"),
+                          W = c(shapiro.test(nfk_div$sprich)$statistic,
+                                shapiro.test(nfk_div$shannon)$statistic,
+                                shapiro.test(nfk_div$std_shannon)$statistic,
+                                shapiro.test(nfk_div$pie)$statistic,
+                                shapiro.test(nfk_div$frich)$statistic,
+                                shapiro.test(nfk_div$pfd)$statistic,
+                                shapiro.test(nfk_div$feve)$statistic,
+                                shapiro.test(nfk_div$rao)$statistic),
+                          p = c(shapiro.test(nfk_div$sprich)$p.value,
+                                shapiro.test(nfk_div$shannon)$p.value,
+                                shapiro.test(nfk_div$std_shannon)$p.value,
+                                shapiro.test(nfk_div$pie)$p.value,
+                                shapiro.test(nfk_div$frich)$p.value,
+                                shapiro.test(nfk_div$pfd)$p.value,
+                                shapiro.test(nfk_div$feve)$p.value,
+                                shapiro.test(nfk_div$rao)$p.value))
+write_csv(metrics_shapiro, "metrics_shapiro.csv")
+```
+
+```{r shapiro-table-out, echo=FALSE, results="asis"}
+kable(metrics_shapiro, caption = "Shapiro-Wilk test results for the metrics.", digits = 3)
+```
+
+```{r metric-distribution}
+ggarrange(plotlist = list(nfk_div %>%
+                            ggplot(aes(x = sprich))+
+                            geom_density()+
+                            xlab("Species richness"),
+                          nfk_div %>%
+                            ggplot(aes(x = shannon))+
+                            geom_density()+
+                            xlab("Shannon index"),
+                          nfk_div %>%
+                            ggplot(aes(x = std_shannon))+
+                            geom_density()+
+                            xlab("Standardized Shannon"),
+                          nfk_div %>%
+                            ggplot(aes(x = pie))+
+                            geom_density()+
+                            xlab("Hurlbert's PIE"),
+                          nfk_div %>%
+                            ggplot(aes(x = frich))+
+                            geom_density()+
+                            xlab("Functional richness"),
+                          nfk_div %>%
+                            ggplot(aes(x = pfd))+
+                            geom_density()+
+                            xlab("Mean distinctiveness"),
+                          nfk_div %>%
+                            ggplot(aes(x = feve))+
+                            geom_density()+
+                            xlab("Functional evenness"),
+                          nfk_div %>%
+                            ggplot(aes(x = rao))+
+                            geom_density()+
+                            xlab("Rao's entropy")),
+  labels = c("A", "C", "B", "D", "E", "F", "G", "H"),
+  ncol = 4, nrow = 2)
+```
+
+
+## Covariation between diversity metrics
+
+```{r covar}
+div_cor <- cor(nfk_div[, -c(1:9)], nfk_div[, -c(1:9)], method = "kendall")
+div_cor_p <- cor.mtest(nfk_div[, -c(1:9)], method = "kendall")$p
+div_cor[which(div_cor_p > 0.01)] <- 0
+corrplot.mixed(div_cor, lower = "number", upper = 'ellipse')
+```
+
+```{r look_at-covars, warning=FALSE, message=FALSE}
+nfk_div %>%
+  filter(sprich > 1) %>%
+  ggplot(aes(x = sprich, y = shannon))+
+  geom_jitter()+
+  geom_smooth()+
+  labs(title = paste("\u03c4 =", round(cor(nfk_div$sprich, 
+                                        nfk_div$shannon, 
+                                        method = "kendall"), 3),
+                     sep = ""))
+
+nfk_div %>%
+  filter(sprich > 1) %>%
+  ggplot(aes(x = sprich, y = frich))+
+  geom_jitter()+
+  geom_smooth()+
+  labs(title = paste("\u03c4 =", round(cor(nfk_div$sprich, 
+                                        nfk_div$frich, 
+                                        method = "kendall"), 3),
+                     sep = ""))
+
+nfk_div %>%
+  filter(sprich > 1) %>%
+  ggplot(aes(x = sprich, y = rao))+
+  geom_jitter()+
+  geom_smooth()+
+  labs(title = paste("\u03c4 =", round(cor(nfk_div$sprich, 
+                                        nfk_div$rao, 
+                                        method = "kendall"), 3),
+                     sep = ""))
+
+nfk_div %>%
+  filter(sprich > 1) %>%
+  ggplot(aes(x = shannon, y = frich))+
+  geom_jitter()+
+  geom_smooth()+
+  labs(title = paste("\u03c4 =", round(cor(nfk_div$shannon, 
+                                        nfk_div$frich, 
+                                        method = "kendall"), 3),
+                     sep = ""))
+
+nfk_div %>%
+  filter(sprich > 1) %>%
+  ggplot(aes(x = shannon, y = rao))+
+  geom_jitter()+
+  geom_smooth()+
+  labs(title = paste("\u03c4 =", round(cor(nfk_div$shannon, 
+                                        nfk_div$rao, 
+                                        method = "kendall"), 3),
+                     sep = ""))
+
+nfk_div %>%
+  filter(sprich > 1) %>%
+  ggplot(aes(x = std_shannon, y = pie))+
+  geom_jitter()+
+  geom_smooth()+
+  labs(title = paste("\u03c4 =", round(cor(nfk_div$std_shannon, 
+                                        nfk_div$pie, 
+                                        method = "kendall"), 3),
+                     sep = ""))
+```
+
+## Building models
+
+All models account for a day of observation as a cubic spline smoothing term in each model, assuming that observed diversity metrics are *some* functions of the day of observation (`Day`), and accounting for the random effect of location (`Point`).
+
+Regarding the effect of time-of-day on diversity level, there are several scenarios considered:
+
+  - **intercept model** `[Metric] ~ (1 | Point) + s(Day)` assumes that the diversity metric is not related to time-of-day, therefore, this relationship could be described as an intercept model;
+  
+  - **linear model** `[Metric] ~ 1 + (Daytime | Point) + s(Day)` assumes that the diversity metric is linearly related to time-of-day;
+  
+  - **quadratic model** `[Metric] ~ 1 + (Daytime | Point) + (Daytime | Point)^2 + s(Day)` assumes that the relationship between time-of-day and diversity metric is hump-shaped;
+  
+  - **cubic model** `[Metric] ~ 1 + (Daytime | Point) + (Daytime | Point)^2 + (Daytime | Point)^3 + s(Day)` assumes that the relationship between time-of-day and diversity metric is cubic;
+  
+  - **generalized additive model** `[Metric] ~ 1 + s((Daytime | Point)) + s(Day)` assumes that the diversity metric is non-linearly related to time-of-day.
+
+```{r model-build, warning=FALSE, error=FALSE, message=FALSE}
+nfk_modelbuild <- function(response, name){
+  d_f <- data.frame(response = response,
+                   Day = unlist(nfk_div$Day),
+                   Point = unlist(nfk_div$Point),
+                   Daytime = unlist(nfk_div$Daytime))
+  poly0 <- gamm(response ~ 1 + s(Day, bs = "cr"), 
+                data = d_f, 
+                random = list(Point = ~ 1))
+  poly1 <- gamm(response ~ poly(Daytime, 1) + s(Day, bs = "cr"), 
+                data = d_f, 
+                random = list(Point = ~ Daytime))
+  poly2 <- gamm(response ~ poly(Daytime, 2) + s(Day, bs = "cr"), 
+                data = d_f, 
+                random = list(Point = ~ Daytime))
+  poly3 <- gamm(response ~ poly(Daytime, 3) + s(Day, bs = "cr"), 
+                data = d_f, 
+                random = list(Point = ~ Daytime))
+  # gam0 <- gamm(response ~ s(Daytime, bs = "cr") + s(Day, bs = "cr"), 
+  #               data = d_f, 
+  #               random = list(Point = ~ Daytime))
+  # modelslist <- list(poly0,  poly1, poly2, poly3, gam0)
+  modelslist <- list(poly0,  poly1, poly2, poly3)
+  # names(modelslist) = c(paste(name, "~ Intercept | Point + s(Day)"),
+  #                       paste(name, "~ LM | Point + s(Day)"),
+  #                       paste(name, "~ poly(2) | Point + s(Day)"),
+  #                       paste(name, "~ poly(3) | Point + s(Day)"),
+  #                       paste(name, "~ GAM | Point + s(Day)"))
+  names(modelslist) = c(paste(name, "~ Intercept | Point + s(Day)"),
+                        paste(name, "~ LM | Point + s(Day)"),
+                        paste(name, "~ poly(2) | Point + s(Day)"),
+                        paste(name, "~ poly(3) | Point + s(Day)"))
+  return(modelslist)
+}
+
+models_sprich <- nfk_modelbuild(response = nfk_div$sprich, 
+                                name = "Species richness")
+models_shannon <- nfk_modelbuild(response = nfk_div$shannon, 
+                                 name = "Shannon index")
+models_std_shannon <- nfk_modelbuild(response = nfk_div$std_shannon, 
+                                     name = "Standardized Shannon")
+models_pie <- nfk_modelbuild(response = nfk_div$pie, 
+                             name = "Hurlbert's PIE")
+
+models_frich <- nfk_modelbuild(response = nfk_div$frich, 
+                               name = "Functional Richness")
+models_feve <- nfk_modelbuild(response = nfk_div$feve, 
+                              name = "Functional Evenness")
+models_rao <- nfk_modelbuild(response = nfk_div$rao, 
+                             name = "Rao's quadratic entropy")
+models_pfd <- nfk_modelbuild(response = nfk_div$pfd, 
+                             name = "Weighted mean functional distinctiveness")
+```
+
+## Selection of the best model for each metric
+
+Best model explaining a particular diversity metric is chosen based on the lowest AICc value for each subset.
+
+```{r aic-predictor}
+aicrank <- function(modlist){
+  
+  reduce_to_lme <- function(modelslist){
+    test <- lapply(1:length(modelslist), function(i) modelslist[[i]][[1]])
+    names(test) <- names(modelslist)
+    return(test)
+  }
+  
+  lmers <- reduce_to_lme(modlist)
+  
+  aicstat <- function(mod){
+    aic <- AICc(mod)
+    ll <- logLik(mod) %>% as.numeric()
+    c(AICc = aic, logL = ll)
+  }
+  
+  
+  aictable <- do.call(rbind.data.frame, lapply(lmers, aicstat))
+  colnames(aictable) <- c("AICc", "logL")
+  
+  aictable$name <- names(lmers)
+  
+  aictable$delta_AICc <- aictable$AICc - min(aictable$AICc)
+  
+  aictable$weight <- qpcR::akaike.weights(aictable$AICc)$weights
+  
+  aictable$df <- lapply(modlist, function(mod){
+    round(sum(mod$gam$edf), 2)
+  }) %>% unlist()
+  
+  aictable[,c("name", "AICc", "delta_AICc", "weight", "logL", "df")] %>%
+    as_tibble() %>%
+    arrange(delta_AICc)
+  
+}
+
+models_ranking <- bind_rows(aicrank(models_sprich),
+                    aicrank(models_shannon),
+                    aicrank(models_std_shannon),
+                    aicrank(models_pie),
+                    aicrank(models_frich),
+                    aicrank(models_pfd),
+                    aicrank(models_feve),
+                    aicrank(models_rao))
+
+write_csv(models_ranking, 
+          file = "aic_table.csv")
+```
+
+```{r aic-table-out, echo=FALSE, results="asis"}
+kable(models_ranking, caption = "Models ranking by AIC", digits = 3)
+```
+
+
+## Diversity metrics vs time-of-day
+
+### Taxonomic diversity
+
+```{r sprich-plot, warning=FALSE, error=FALSE, message=FALSE}
+findrange <- function(vec, p = 0.95, margin = 0.1){
+  bottom <- quantile(vec, (1-p)/2)
+  top <- quantile(vec, p+((1-p)/2))
+  iql <- abs(bottom - top)
+  c(bottom - margin*iql, top + margin*iql)
+}
+
+p_sprich <- ggplot(nfk_div, aes(x = Daytime, y = sprich)) +
+  stat_density_2d(geom = "polygon", contour = TRUE,
+                  aes(fill = after_stat(level)), colour = "black",
+                  bins = 7, show.legend = F)
+plot_lims <- ggplot_build(p_sprich)$panel$ranges[[1]][c("x.range", "y.range")]
+
+p_sprich <- p_sprich +
+  scale_x_continuous(limits = c(-0.1, 1.1), 
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) + 
+  scale_y_continuous(limits = findrange(nfk_div$sprich, 0.95, 0.2)) +
+  coord_cartesian(xlim = plot_lims$x.range, ylim = plot_lims$y.range) +
+  scale_fill_gradient(low="white", high="darkgrey")+
+  theme_classic()+
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "black", se = F, 
+              lwd = 2, linetype = "solid")+
+  geom_vline(xintercept = c(seq(0, 1, 0.25)), color = "grey", linetype = "dashed")+
+  labs(x = "Time of day", y = "Species richness")
+
+p_sprich +
+  geom_smooth(method = "lm", formula = y ~ 1, color = "darkred", se = F, lwd = 1.5, 
+              linetype = "solid", show.legend = T)+
+  geom_smooth(method = "lm", color = "darkgreen", se = F, lwd = 1.5, linetype = "solid")
+```
+
+```{r shannon-plot, warning=FALSE, error=FALSE, message=FALSE}
+p_shannon <- ggplot(nfk_div, aes(x = Daytime, y = shannon)) +
+  stat_density_2d(geom = "polygon", contour = TRUE,
+                  aes(fill = after_stat(level)), colour = "black",
+                  bins = 7, show.legend = F)
+plot_lims <- ggplot_build(p_shannon)$panel$ranges[[1]][c("x.range", "y.range")]
+
+p_shannon <- p_shannon +
+  scale_x_continuous(limits = c(-0.1, 1.1), 
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) + 
+  scale_y_continuous(limits = findrange(nfk_div$shannon, 0.95, 0.2)) +
+  coord_cartesian(xlim = plot_lims$x.range, ylim = plot_lims$y.range) +
+  scale_fill_gradient(low="white", high="darkgrey")+
+  theme_classic()+
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "black", se = F, 
+              lwd = 2, linetype = "solid")+
+  geom_vline(xintercept = c(seq(0, 1, 0.25)), color = "grey", linetype = "dashed")+
+  labs(x = "Time of day", y = "Shannon index")
+
+p_shannon +
+  geom_smooth(method = "lm", formula = y ~ 1, color = "darkred", se = F, lwd = 1.5, 
+              linetype = "solid", show.legend = T)+
+  geom_smooth(method = "lm", color = "darkgreen", se = F, lwd = 1.5, linetype = "solid")
+```
+
+```{r stdshannon-plot, warning=FALSE, message=FALSE}
+p_std_shannon <- ggplot(nfk_div, aes(x = Daytime, y = std_shannon)) +
+  stat_density_2d(geom = "polygon", contour = TRUE,
+                  aes(fill = after_stat(level)), colour = "black",
+                  bins = 7, show.legend = F)
+plot_lims <- ggplot_build(p_std_shannon)$panel$ranges[[1]][c("x.range", "y.range")]
+
+p_std_shannon <- p_std_shannon +
+  scale_x_continuous(limits = c(-0.1, 1.1), 
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) + 
+  scale_y_continuous(limits = findrange(nfk_div$std_shannon, 0.9, 0.1)) +
+  coord_cartesian(xlim = plot_lims$x.range, ylim = plot_lims$y.range) +
+  scale_fill_gradient(low="white", high="darkgrey")+
+  theme_classic()+
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "black", se = F, 
+              lwd = 2, linetype = "solid")+
+  geom_vline(xintercept = c(seq(0, 1, 0.25)), color = "grey", linetype = "dashed")+
+  labs(x = "Time of day", y = "Shannon / lnS")
+
+p_std_shannon +
+  geom_smooth(method = "lm", formula = y ~ 1, color = "darkred", se = F, lwd = 1.5, 
+              linetype = "solid", show.legend = T)+
+  geom_smooth(method = "lm", color = "darkgreen", se = F, lwd = 1.5, linetype = "solid")
+```
+
+```{r pie-plot, warning=FALSE, message=FALSE}
+p_pie <- ggplot(nfk_div, aes(x = Daytime, y = pie)) +
+  stat_density_2d(geom = "polygon", contour = TRUE,
+                  aes(fill = after_stat(level)), colour = "black",
+                  bins = 7, show.legend = F)
+plot_lims <- ggplot_build(p_pie)$panel$ranges[[1]][c("x.range", "y.range")]
+
+p_pie <- p_pie +
+  scale_x_continuous(limits = c(-0.1, 1.1), 
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) + 
+  scale_y_continuous(limits = findrange(nfk_div$pie, 0.95, 0.2)) +
+  coord_cartesian(xlim = plot_lims$x.range, ylim = plot_lims$y.range) +
+  scale_fill_gradient(low="white", high="darkgrey")+
+  theme_classic()+
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "black", se = F, 
+              lwd = 2, linetype = "solid")+
+  geom_vline(xintercept = c(seq(0, 1, 0.25)), color = "grey", linetype = "dashed")+
+  labs(x = "Time of day", y = "Hurlbert's PIE")
+
+p_pie +
+  geom_smooth(method = "lm", formula = y ~ 1, color = "darkred", se = F, lwd = 1.5, 
+              linetype = "solid", show.legend = T)+
+  geom_smooth(method = "lm", color = "darkgreen", se = F, lwd = 1.5, linetype = "solid")
+```
+
+### Functional diversity
+
+```{r frich-plot, warning=FALSE, message=FALSE}
+p_frich <- ggplot(nfk_div, aes(x = Daytime, y = frich)) +
+  stat_density_2d(geom = "polygon", contour = TRUE,
+                  aes(fill = after_stat(level)), colour = "black",
+                  bins = 7, show.legend = F)
+plot_lims <- ggplot_build(p_frich)$panel$ranges[[1]][c("x.range", "y.range")]
+
+p_frich <- p_frich +
+  scale_x_continuous(limits = c(-0.1, 1.1), 
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) + 
+  scale_y_continuous(limits = findrange(nfk_div$frich, 0.9, 0.1)) +
+  coord_cartesian(xlim = plot_lims$x.range, ylim = plot_lims$y.range) +
+  scale_fill_gradient(low="white", high="darkgrey")+
+  theme_classic()+
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "black", se = F, 
+              lwd = 2, linetype = "solid")+
+  geom_vline(xintercept = c(seq(0, 1, 0.25)), color = "grey", linetype = "dashed")+
+  labs(x = "Time of day", y = "Functional richness")
+
+p_frich +
+  geom_smooth(method = "lm", formula = y ~ 1, color = "darkred", se = F, lwd = 1.5, 
+              linetype = "solid", show.legend = T)+
+  geom_smooth(method = "lm", color = "darkgreen", se = F, lwd = 1.5, linetype = "solid")
+```
+
+```{r pfd-plot, warning=FALSE, message=FALSE}
+p_pfd <- ggplot(nfk_div, aes(x = Daytime, y = pfd)) +
+  stat_density_2d(geom = "polygon", contour = TRUE,
+                  aes(fill = after_stat(level)), colour = "black",
+                  bins = 7, show.legend = F)
+plot_lims <- ggplot_build(p_pfd)$panel$ranges[[1]][c("x.range", "y.range")]
+
+p_pfd <- p_pfd +
+  scale_x_continuous(limits = c(-0.1, 1.1), 
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) + 
+  scale_y_continuous(limits = findrange(nfk_div$pfd, 0.95, 0.2)) +
+  coord_cartesian(xlim = plot_lims$x.range, ylim = plot_lims$y.range) +
+  scale_fill_gradient(low="white", high="darkgrey")+
+  theme_classic() +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "black", se = F, 
+              lwd = 2, linetype = "solid")+
+  geom_vline(xintercept = c(seq(0, 1, 0.25)), color = "grey", linetype = "dashed")+
+  labs(x = "Time of day", y = "Mean distinctiveness")
+
+p_pfd +
+  geom_smooth(method = "lm", formula = y ~ 1, color = "darkred", se = F, lwd = 1.5, 
+              linetype = "solid", show.legend = T)+
+  geom_smooth(method = "lm", color = "darkgreen", se = F, lwd = 1.5, linetype = "solid")
+```
+
+```{r feve-plot, warning=FALSE, message=FALSE}
+p_feve <- ggplot(nfk_div, aes(x = Daytime, y = feve)) +
+  stat_density_2d(geom = "polygon", contour = TRUE,
+                  aes(fill = after_stat(level)), colour = "black",
+                  bins = 7, show.legend = F)
+plot_lims <- ggplot_build(p_feve)$panel$ranges[[1]][c("x.range", "y.range")]
+
+p_feve <- p_feve +
+  scale_x_continuous(limits = c(-0.1, 1.1), 
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) + 
+  scale_y_continuous(limits = findrange(nfk_div$feve, 0.95, 0.2)) +
+  coord_cartesian(xlim = plot_lims$x.range, ylim = plot_lims$y.range) +
+  scale_fill_gradient(low="white", high="darkgrey")+
+  theme_classic()+
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "black", se = F, 
+              lwd = 2, linetype = "solid")+
+  geom_vline(xintercept = c(seq(0, 1, 0.25)), color = "grey", linetype = "dashed")+
+  labs(x = "Time of day", y = "Functional evenness")
+
+p_feve +
+  geom_smooth(method = "lm", formula = y ~ 1, color = "darkred", se = F, lwd = 1.5, 
+              linetype = "solid", show.legend = T)+
+  geom_smooth(method = "lm", color = "darkgreen", se = F, lwd = 1.5, linetype = "solid")
+```
+
+```{r rao-plot, warning=FALSE, message=FALSE}
+p_rao <- ggplot(nfk_div, aes(x = Daytime, y = rao)) +
+  stat_density_2d(geom = "polygon", contour = TRUE,
+                  aes(fill = after_stat(level)), colour = "black",
+                  bins = 7, show.legend = F)
+plot_lims <- ggplot_build(p_rao)$panel$ranges[[1]][c("x.range", "y.range")]
+
+p_rao <- p_rao +
+  scale_x_continuous(limits = c(-0.1, 1.1), 
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) + 
+  scale_y_continuous(limits = findrange(nfk_div$rao, 0.95, 0.2)) +
+  coord_cartesian(xlim = plot_lims$x.range, ylim = plot_lims$y.range) +
+  scale_fill_gradient(low="white", high="darkgrey")+
+  theme_classic()+
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "black", se = F, 
+              lwd = 2, linetype = "solid")+
+  geom_vline(xintercept = c(seq(0, 1, 0.25)), color = "grey", linetype = "dashed")+
+  labs(x = "Time of day", y = "Rao's entropy")
+
+p_rao +
+  geom_smooth(method = "lm", formula = y ~ 1, color = "darkred", se = F, lwd = 1.5, 
+              linetype = "solid", show.legend = T)+
+  geom_smooth(method = "lm", color = "darkgreen", se = F, lwd = 1.5, linetype = "solid")
+```
+
+### Figure 1
+
+The code provided to recreate Fig. 1 from the main text.
+
+```{r fig1, warning=FALSE, error=FALSE, message=FALSE}
+fig1 <- ggarrange(plotlist = list(p_sprich, p_shannon, p_std_shannon, p_pie, 
+                                  p_frich, p_pfd, p_feve, p_rao),
+  labels = c("A", "B", "C", "D", "E", "F", "G", "H"),
+  ncol = 4, nrow = 2)
+fig1
+
+png(filename = "./fig_1.png",
+    width = 9, height = 5,units = "in", res = 600)
+fig1
+dev.off()
+```
+
+### Figure S4
+
+```{r fig_s4}
+png(
+  filename = "./fig_s4A.png",
+  width = 5,
+  height = 5,
+  units = "in",
+  res = 600
+)
+corrplot(cor(td_weighted[,!is.na(apply(td_weighted, 2, var))],
+             td_pca_weighted$x, method = "kendall"),
+         method = "ellipse")
+dev.off()
+png(
+  filename = "./fig_s4B.png",
+  width = 5,
+  height = 7,
+  units = "in",
+  res = 600
+)
+# corrplot(cor(td_weighted[,!is.na(apply(td_weighted, 2, var))],
+#              td_pca_weighted$x, method = "kendall"), method = "ellipse")
+ggarrange(
+  plotlist = list(
+    corrplot(
+      cor(td_weighted[,!is.na(apply(td_weighted, 2, var))],
+          td_pca_weighted$x, method = "kendall"),
+      method = "ellipse"
+    ),
+    qplot(1:22, ((td_pca_weighted$sdev ^ 2) * 100 / sum(td_pca_weighted$sdev ^
+                                                          2)
+    )) +
+      geom_line() +
+      geom_point(size = 4) +
+      xlab("Principal Component") +
+      ylab("Variance Explained, %") +
+      ggtitle("Scree Plot") +
+      ylim(0, 30)
+  ),
+  ncol = 1,
+  nrow = 2,
+  labels = c("A", "B"),
+  heights = c(4, 3)
+)
+dev.off()
+```
+
+### Figure S5
+
+```{r fig_s5}
+png(filename = "./fig_s5.png",
+    width = 9, height = 5,units = "in", res = 600)
+ggarrange(plotlist = list(nfk_div %>%
+                            ggplot(aes(x = sprich))+
+                            geom_density()+
+                            xlab("Species richness"),
+                          nfk_div %>%
+                            ggplot(aes(x = shannon))+
+                            geom_density()+
+                            xlab("Shannon index"),
+                          nfk_div %>%
+                            ggplot(aes(x = std_shannon))+
+                            geom_density()+
+                            xlab("Standardized Shannon"),
+                          nfk_div %>%
+                            ggplot(aes(x = pie))+
+                            geom_density()+
+                            xlab("Hurlbert's PIE"),
+                          nfk_div %>%
+                            ggplot(aes(x = frich))+
+                            geom_density()+
+                            xlab("Functional richness"),
+                          nfk_div %>%
+                            ggplot(aes(x = pfd))+
+                            geom_density()+
+                            xlab("Mean distinctiveness"),
+                          nfk_div %>%
+                            ggplot(aes(x = feve))+
+                            geom_density()+
+                            xlab("Functional evenness"),
+                          nfk_div %>%
+                            ggplot(aes(x = rao))+
+                            geom_density()+
+                            xlab("Rao's entropy")),
+  labels = c("A", "C", "B", "D", "E", "F", "G", "H"),
+  ncol = 4, nrow = 2)
+dev.off()
+```
+
+### Figure S6
+
+```{r fig_s6}
+png(filename = "./fig_s6.png",
+    width = 10, height = 10,units = "in", res = 600)
+corrplot.mixed(div_cor, lower = "number", upper = 'ellipse')
+dev.off()
+```
+
